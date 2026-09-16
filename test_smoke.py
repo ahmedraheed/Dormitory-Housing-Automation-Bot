@@ -1,4 +1,4 @@
-"""
+﻿"""
 Sanity-check script for dorm_agent.py.
 Imports all modules, validates Config env-var loading, and verifies
 the Telegram helper wiring without actually calling the live API.
@@ -7,17 +7,17 @@ Run: python test_smoke.py
 import os
 import sys
 
-# ── Inject dummy env vars so Config.validate() passes ──────────────────────
-os.environ.setdefault("APPLICANT_FIRST_NAME", "Test")
-os.environ.setdefault("APPLICANT_LAST_NAME", "User")
-os.environ.setdefault("APPLICANT_EMAIL", "test@example.com")
-os.environ.setdefault("APPLICANT_PHONE", "+491234567890")
-os.environ.setdefault("TELEGRAM_BOT_TOKEN", "")  # disabled
-os.environ.setdefault("TELEGRAM_CHAT_ID", "")    # disabled
+# Disable actual network alerts for testing
+os.environ["NTFY_TOPIC"] = ""
+os.environ["DISCORD_WEBHOOK"] = ""
+os.environ["ALERT_EMAIL_FROM"] = ""
+os.environ["TELEGRAM_BOT_TOKEN"] = ""
+os.environ["TELEGRAM_CHAT_ID"] = ""
 
 from dorm_agent import (
     Config,
     send_telegram,
+    _send_telegram,
     human_delay,
     Selectors,
     first_visible,
@@ -27,21 +27,21 @@ from dorm_agent import (
 )
 
 print("=" * 60)
-print("StwDO Dorm Agent — Smoke Test")
+print("StwDO Dorm Agent - Smoke Test")
 print("=" * 60)
 
 # 1. Config validation
 try:
     Config.validate()
-    print("[PASS] Config.validate() — all required fields present")
+    print("[PASS] Config.validate() - all required fields present")
 except Exception as e:
     print(f"[FAIL] Config.validate(): {e}")
     sys.exit(1)
 
-# 2. Telegram (no token set → should return False gracefully)
-result = send_telegram("Test message")
+# 2. Telegram (no token set -> should return False gracefully)
+result = _send_telegram("Test message")
 assert result is False, "send_telegram should return False when no token"
-print("[PASS] send_telegram() returns False gracefully with no token")
+print("[PASS] _send_telegram() returns False gracefully with no token")
 
 # 3. human_delay
 import time

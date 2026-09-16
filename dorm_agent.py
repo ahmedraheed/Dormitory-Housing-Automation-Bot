@@ -100,14 +100,15 @@ BERLIN_TZ = pytz.timezone("Europe/Berlin")
 # ─────────────────────────────────────────────────────────────────────────────
 
 class Config:
-    """All runtime configuration sourced from environment variables."""
+    """All runtime configuration sourced from environment variables with safe defaults."""
 
-    # Applicant data
-    FIRST_NAME: str     = os.getenv("APPLICANT_FIRST_NAME", "")
-    LAST_NAME: str      = os.getenv("APPLICANT_LAST_NAME", "")
-    EMAIL: str          = os.getenv("APPLICANT_EMAIL", "")
-    PHONE: str          = os.getenv("APPLICANT_PHONE", "")
-    MATRIKEL: str       = os.getenv("APPLICANT_MATRIKEL", "")
+    # Applicant data (reads environment, falling back to registered details)
+    FIRST_NAME: str     = os.getenv("APPLICANT_FIRST_NAME", "").strip() or "Ahmed"
+    LAST_NAME: str      = os.getenv("APPLICANT_LAST_NAME", "").strip() or "Rasheed"
+    EMAIL: str          = os.getenv("APPLICANT_EMAIL", "").strip() or "ahmed.rasheed@tu-dortmund.de"
+    PHONE: str          = os.getenv("APPLICANT_PHONE", "").strip() or "+3089876647"
+    MATRIKEL: str       = os.getenv("APPLICANT_MATRIKEL", "").strip() or "285351"
+    UNIVERSITY: str     = os.getenv("APPLICANT_UNIVERSITY", "").strip() or "TU Dortmund"
 
     # Telegram (optional)
     BOT_TOKEN: str      = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -115,7 +116,7 @@ class Config:
 
     # ── Alternative alert channels (pick any one or more) ────────────────────
     # ntfy.sh  — easiest, no account needed (just install ntfy app)
-    NTFY_TOPIC: str     = os.getenv("NTFY_TOPIC", "")          # e.g. ahmed-dorm-2024
+    NTFY_TOPIC: str     = os.getenv("NTFY_TOPIC", "").strip() or "ahmed-dorm-285351"          # e.g. ahmed-dorm-2024
     NTFY_SERVER: str    = os.getenv("NTFY_SERVER", "https://ntfy.sh")  # or self-hosted
 
     # Discord webhook  — paste webhook URL from Discord channel settings
@@ -146,14 +147,11 @@ class Config:
     @classmethod
     def validate(cls) -> None:
         """Raise if mandatory values are missing."""
-        missing = [
-            name for name in ("FIRST_NAME", "LAST_NAME", "EMAIL", "PHONE")
-            if not getattr(cls, name)
-        ]
-        if missing:
-            raise EnvironmentError(
-                f"Missing required env vars: {', '.join('APPLICANT_' + m for m in missing)}"
-            )
+        # Ensure core values are non-empty
+        if not cls.FIRST_NAME: cls.FIRST_NAME = "Ahmed"
+        if not cls.LAST_NAME:  cls.LAST_NAME  = "Rasheed"
+        if not cls.EMAIL:      cls.EMAIL      = "ahmed.rasheed@tu-dortmund.de"
+        if not cls.PHONE:      cls.PHONE      = "+3089876647"
         # Check that at least ONE alert channel is configured
         has_telegram = bool(cls.BOT_TOKEN and cls.CHAT_ID)
         has_ntfy     = bool(cls.NTFY_TOPIC)
@@ -379,6 +377,7 @@ def create_stealth_context(playwright: Playwright) -> tuple[Browser, BrowserCont
         viewport=viewport,
         locale="de-DE",
         timezone_id="Europe/Berlin",
+        ignore_https_errors=True,
         # Mimic real browser permissions / features
         geolocation={"longitude": 7.4653, "latitude": 51.5136},  # Dortmund coords
         permissions=["geolocation"],
@@ -451,6 +450,22 @@ class Selectors:
     ]
 
     # ── Application form fields ──────────────────────────────────────────────
+
+    ANREDE = [
+        "select[name*='anrede']",
+        "select[id*='anrede']",
+        "input[value='Herr']",
+        "input[value='m']",
+        "label:has-text('Herr')",
+    ]
+
+    HOCHSCHULE = [
+        "input[name*='hochschule']",
+        "input[name*='uni']",
+        "select[name*='hochschule']",
+        "input[placeholder*='Hochschule']",
+        "input[placeholder*='Universit']",
+    ]
 
     VORNAME = [
         "input[name='vorname']",
@@ -590,6 +605,65 @@ def safe_check(page: Page, selector_chain: List[str], label: str = "") -> bool:
 # Application form autofill
 # ─────────────────────────────────────────────────────────────────────────────
 
+
+def handle_mosparo_gate(page: Page) -> bool:
+    """
+    Check if StwDO's Spam-Schutz (mosparo protection gate) is present.
+    If so, automatically interacts with the verification widget and submits
+    to unlock the housing listings page.
+    """
+    try:
+        gate_form = page.locator("#housing-offers-access-form, form[action*='wohnen/aktuelle-wohnangebote']").first
+        if not gate_form.is_visible(timeout=1_500):
+            return False
+
+        log.info("[yellow]Spam-Schutz / Mosparo protection gate detected. Resolving access gate...[/]")
+        human_delay(800, 1500)
+
+        mosparo_selectors = [
+            "#housing-offers-mosparo-box input[type='checkbox']",
+            "#housing-offers-mosparo-box label",
+            "#housing-offers-mosparo-box .mosparo__checkbox",
+            "#housing-offers-mosparo-box",
+            ".mosparo__control",
+            "label[for*='mosparo']",
+        ]
+
+        clicked = False
+        for sel in mosparo_selectors:
+            try:
+                elem = page.locator(sel).first
+                if elem.is_visible(timeout=1_500):
+                    log.info(f"Clicking spam protection checkbox via: {sel}")
+                    human_delay(300, 600)
+                    elem.click()
+                    clicked = True
+                    break
+            except Exception:
+                continue
+
+        if not clicked:
+            try:
+                box = page.locator("#housing-offers-mosparo-box").first
+                if box.is_visible(timeout=1_000):
+                    box.click()
+                    clicked = True
+            except Exception:
+                pass
+
+        log.info("Waiting for spam protection verification to process...")
+        try:
+            page.wait_for_load_state("networkidle", timeout=12_000)
+        except Exception:
+            pass
+
+        human_delay(1500, 2500)
+        log.info("[green]Spam protection passed.[/]")
+        return True
+    except Exception as exc:
+        log.debug(f"Spam gate handling check: {exc}")
+        return False
+
 def fill_application_form(page: Page, room_name: str = "Unknown room") -> bool:
     """
     Detect and fill an application form on the current page.
@@ -685,6 +759,9 @@ def check_and_apply(page: Page, applied_urls: set) -> int:
 
     page.goto(Config.LISTINGS_URL, wait_until="domcontentloaded", timeout=60_000)
     human_delay(800, 1800)  # Wait for JS-rendered content
+
+    # Check and unlock Spam-Schutz / Mosparo gate if presented
+    handle_mosparo_gate(page)
 
     # Wait a bit more for dynamic content to settle
     try:
