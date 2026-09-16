@@ -1,0 +1,104 @@
+name: StwDO Dorm Monitor
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Triggers:
+#   1. Scheduled cron — fires at 09:55 Berlin time on Mondays and Wednesdays
+#      (GitHub Actions runs in UTC; Berlin is UTC+1 in winter / UTC+2 in summer)
+#      We use 08:55 UTC to cover CET (UTC+1). During CEST (summer, UTC+2) the
+#      bot fires at 10:55 Berlin — still within the drop window.
+#      ┌─ minute (55)
+#      │  ┌─ hour (08 UTC = 09/10 Berlin depending on DST)
+#      │  │  ┌─ day-of-month (*)
+#      │  │  │  ┌─ month (*)
+#      │  │  │  │  ┌─ day-of-week (1=Monday, 3=Wednesday)
+#      55 8  *  *  1,3
+#   2. workflow_dispatch — manual trigger for debugging
+# ──────────────────────────────────────────────────────────────────────────────
+
+on:
+  schedule:
+    # 09:55 CET (UTC+1) = 08:55 UTC → Mondays and Wednesdays
+    - cron: "55 8 * * 1,3"
+  workflow_dispatch:
+    inputs:
+      headless:
+        description: "Run browser in headless mode? (true/false)"
+        required: false
+        default: "true"
+      max_runtime_minutes:
+        description: "Override MAX_RUNTIME_MINUTES (minutes)"
+        required: false
+        default: "90"
+      polling_interval_seconds:
+        description: "Override POLLING_INTERVAL_SECONDS (seconds)"
+        required: false
+        default: "30"
+
+# Cancel any in-progress run if a new one is triggered
+concurrency:
+  group: stwdo-monitor
+  cancel-in-progress: true
+
+jobs:
+  monitor:
+    name: Monitor StwDO Listings
+    runs-on: ubuntu-latest
+    timeout-minutes: 110   # hard cap — slightly above MAX_RUNTIME_MINUTES
+
+    steps:
+      # ── 1. Checkout repository ────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Set up Python 3.11 ─────────────────────────────────────────────
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      # ── 3. Install Python dependencies ────────────────────────────────────
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # ── 4. Install Playwright system-level Chromium browser + deps ────────
+      - name: Install Playwright browsers
+        run: |
+          playwright install chromium
+          playwright install-deps chromium
+
+      # ── 5. Run the monitoring bot ─────────────────────────────────────────
+      - name: Run StwDO Dorm Monitor
+        env:
+          # ── Applicant data (store in GitHub Secrets → Settings → Secrets) ─
+          APPLICANT_FIRST_NAME:    ${{ secrets.APPLICANT_FIRST_NAME }}
+          APPLICANT_LAST_NAME:     ${{ secrets.APPLICANT_LAST_NAME }}
+          APPLICANT_EMAIL:         ${{ secrets.APPLICANT_EMAIL }}
+          APPLICANT_PHONE:         ${{ secrets.APPLICANT_PHONE }}
+          APPLICANT_MATRIKEL:      ${{ secrets.APPLICANT_MATRIKEL }}
+
+          # ── Telegram credentials ─────────────────────────────────────────
+          TELEGRAM_BOT_TOKEN:      ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:        ${{ secrets.TELEGRAM_CHAT_ID }}
+
+          # ── Runtime configuration ─────────────────────────────────────────
+          LISTINGS_URL:            "https://www.stwdo.de/wohnen/aktuelle-wohnangebote"
+          HEADLESS:                ${{ github.event.inputs.headless || 'true' }}
+          MAX_RUNTIME_MINUTES:     ${{ github.event.inputs.max_runtime_minutes || '90' }}
+          POLLING_INTERVAL_SECONDS: ${{ github.event.inputs.polling_interval_seconds || '30' }}
+          MIN_ACTION_DELAY_MS:     "300"
+          MAX_ACTION_DELAY_MS:     "1200"
+
+        run: python dorm_agent.py
+
+      # ── 6. Upload logs on failure (optional artifact for debugging) ────────
+      - name: Upload failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failure-logs-${{ github.run_id }}
+          path: "*.log"
+          if-no-files-found: ignore
+          retention-days: 7
