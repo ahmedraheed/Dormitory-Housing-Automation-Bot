@@ -417,8 +417,13 @@ class Selectors:
     APPLY_BUTTONS = [
         "a:has-text('Bewerben')",
         "a:has-text('Jetzt bewerben')",
+        "a:has-text('Online bewerben')",
+        "a:has-text('Zur Bewerbung')",
+        "a:has-text('Hier bewerben')",
         "button:has-text('Bewerben')",
         "button:has-text('Jetzt bewerben')",
+        "button:has-text('Online bewerben')",
+        "a[href*='bewerb']",
         "[data-action='apply']",
         ".apply-button",
         ".bewerben",
