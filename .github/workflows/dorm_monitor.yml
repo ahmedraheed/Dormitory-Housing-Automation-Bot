@@ -1,18 +1,26 @@
 ﻿name: StwDO Dorm Monitor
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Triggers:
-#   1. Scheduled cron – fires at 09:55 Berlin time on Mondays and Wednesdays
-#      (GitHub Actions runs in UTC; Berlin is UTC+1 in winter / UTC+2 in summer)
-#      09:55 CET = 08:55 UTC
-#      55 8 * * 1,3
-#   2. workflow_dispatch – manual trigger from GitHub Actions UI anytime
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
+# SCHEDULE STRATEGY:
+#   StwDO releases rooms on Monday & Wednesday mornings (Berlin time).
+#   We run MULTIPLE cron triggers in waves to cover the full morning window
+#   (09:00 - 13:00 Berlin), since each run lasts ~90 minutes of polling.
+#
+#   Wave 1: 07:00 UTC = 09:00 CEST   (Monday & Wednesday)
+#   Wave 2: 08:30 UTC = 10:30 CEST   (Monday & Wednesday)
+#   Wave 3: 10:00 UTC = 12:00 CEST   (Monday & Wednesday)
+#
+#   If a run is already active, new triggers are CANCELLED (concurrency group).
+#   So only ONE run is ever active at a time, but new waves restart fresh.
+# =============================================================================
 
 on:
   schedule:
-    # 09:55 CET (UTC+1) = 08:55 UTC on Mondays and Wednesdays
-    - cron: "55 8 * * 1,3"
+    # --- MONDAY & WEDNESDAY morning waves (CEST = UTC+2) ---
+    - cron: "0 7 * * 1,3"    # Wave 1: 09:00 Berlin
+    - cron: "30 8 * * 1,3"   # Wave 2: 10:30 Berlin
+    - cron: "0 10 * * 1,3"   # Wave 3: 12:00 Berlin
+
   workflow_dispatch:
     inputs:
       headless:
@@ -20,15 +28,15 @@ on:
         required: false
         default: "true"
       max_runtime_minutes:
-        description: "Override MAX_RUNTIME_MINUTES (minutes)"
+        description: "Override MAX_RUNTIME_MINUTES (minutes, max 85)"
         required: false
-        default: "90"
+        default: "85"
       polling_interval_seconds:
         description: "Override POLLING_INTERVAL_SECONDS (seconds)"
         required: false
-        default: "30"
+        default: "20"
 
-# Cancel any in-progress run if a new one is triggered
+# If a new cron wave fires while a run is active, cancel the old one and start fresh.
 concurrency:
   group: stwdo-monitor
   cancel-in-progress: true
@@ -37,67 +45,68 @@ jobs:
   monitor:
     name: Monitor StwDO Listings
     runs-on: ubuntu-latest
-    timeout-minutes: 110   # hard cap – slightly above MAX_RUNTIME_MINUTES
+    timeout-minutes: 110
 
     steps:
-      # ── 1. Checkout repository ─────────────────────────────────────────────
+      # 1. Checkout repository
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ── 2. Set up Python 3.11 ──────────────────────────────────────────────
+      # 2. Set up Python 3.11
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: "pip"
 
-      # ── 3. Install Python dependencies ─────────────────────────────────────
+      # 3. Install Python dependencies
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # ── 4. Install Playwright system-level Chromium browser + deps ──────────
+      # 4. Install Playwright Chromium browser
       - name: Install Playwright browsers
         run: |
           playwright install chromium
           playwright install-deps chromium
 
-      # ── 5. Run the monitoring bot ──────────────────────────────────────────
+      # 5. Run the monitoring bot
       - name: Run StwDO Dorm Monitor
         env:
-          # Applicant personal data (GitHub Secrets with fallback defaults so it NEVER crashes)
+          # ── Applicant personal data (with safe fallback defaults) ──────────
           APPLICANT_FIRST_NAME:     ${{ secrets.APPLICANT_FIRST_NAME || 'Ahmed' }}
           APPLICANT_LAST_NAME:      ${{ secrets.APPLICANT_LAST_NAME || 'Rasheed' }}
           APPLICANT_EMAIL:          ${{ secrets.APPLICANT_EMAIL || 'ahmed.rasheed@tu-dortmund.de' }}
           APPLICANT_PHONE:          ${{ secrets.APPLICANT_PHONE || '+3089876647' }}
           APPLICANT_MATRIKEL:       ${{ secrets.APPLICANT_MATRIKEL || '285351' }}
+          APPLICANT_UNIVERSITY:     "TU Dortmund"
 
-          # Push alert channels (ntfy.sh push alert straight to phone)
+          # ── ntfy.sh push alert (instant phone notification) ───────────────
           NTFY_TOPIC:               ${{ secrets.NTFY_TOPIC || 'ahmed-dorm-285351' }}
           NTFY_SERVER:              ${{ secrets.NTFY_SERVER || 'https://ntfy.sh' }}
 
-          # Telegram credentials (optional)
+          # ── Telegram (optional) ────────────────────────────────────────────
           TELEGRAM_BOT_TOKEN:       ${{ secrets.TELEGRAM_BOT_TOKEN || '' }}
           TELEGRAM_CHAT_ID:         ${{ secrets.TELEGRAM_CHAT_ID || '' }}
 
-          # Discord / Email (optional)
+          # ── Discord / Email (optional) ─────────────────────────────────────
           DISCORD_WEBHOOK:          ${{ secrets.DISCORD_WEBHOOK || '' }}
           ALERT_EMAIL_FROM:         ${{ secrets.ALERT_EMAIL_FROM || '' }}
           ALERT_EMAIL_TO:           ${{ secrets.ALERT_EMAIL_TO || '' }}
           ALERT_EMAIL_PASS:         ${{ secrets.ALERT_EMAIL_PASS || '' }}
 
-          # Runtime configuration
+          # ── Runtime config ─────────────────────────────────────────────────
           LISTINGS_URL:             "https://www.stwdo.de/wohnen/aktuelle-wohnangebote"
           HEADLESS:                 ${{ github.event.inputs.headless || 'true' }}
-          MAX_RUNTIME_MINUTES:      ${{ github.event.inputs.max_runtime_minutes || '90' }}
-          POLLING_INTERVAL_SECONDS:  ${{ github.event.inputs.polling_interval_seconds || '30' }}
-          MIN_ACTION_DELAY_MS:      "300"
-          MAX_ACTION_DELAY_MS:      "1200"
+          MAX_RUNTIME_MINUTES:      ${{ github.event.inputs.max_runtime_minutes || '85' }}
+          POLLING_INTERVAL_SECONDS: ${{ github.event.inputs.polling_interval_seconds || '20' }}
+          MIN_ACTION_DELAY_MS:      "200"
+          MAX_ACTION_DELAY_MS:      "800"
 
         run: python dorm_agent.py
 
-      # ── 6. Upload logs and artifacts on failure ─────────────────────────────
+      # 6. Upload failure artifacts
       - name: Upload failure artifacts
         if: failure()
         uses: actions/upload-artifact@v4
