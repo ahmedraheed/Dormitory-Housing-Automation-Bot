@@ -1,4 +1,4 @@
-﻿"""
+"""
 Sanity-check script for dorm_agent.py.
 Imports all modules, validates Config env-var loading, and verifies
 the Telegram helper wiring without actually calling the live API.
@@ -7,12 +7,15 @@ Run: python test_smoke.py
 import os
 import sys
 
-# Disable actual network alerts for testing
-os.environ["NTFY_TOPIC"] = ""
-os.environ["DISCORD_WEBHOOK"] = ""
-os.environ["ALERT_EMAIL_FROM"] = ""
-os.environ["TELEGRAM_BOT_TOKEN"] = ""
-os.environ["TELEGRAM_CHAT_ID"] = ""
+# NOTE: We must set os.environ BEFORE importing dorm_agent because the Config
+# class attributes are evaluated at class-definition time during import.
+# However, load_dotenv() inside dorm_agent will still override these with .env values.
+# To truly isolate, we override the Config class attributes AFTER import.
+os.environ.setdefault("NTFY_TOPIC", "")
+os.environ.setdefault("DISCORD_WEBHOOK", "")
+os.environ.setdefault("ALERT_EMAIL_FROM", "")
+os.environ.setdefault("TELEGRAM_BOT_TOKEN", "")
+os.environ.setdefault("TELEGRAM_CHAT_ID", "")
 
 from dorm_agent import (
     Config,
@@ -25,6 +28,15 @@ from dorm_agent import (
     _apply_stealth,
     BERLIN_TZ,
 )
+
+# Disable all alert channels for testing (override class attrs directly)
+Config.BOT_TOKEN = ""
+Config.CHAT_ID = ""
+Config.NTFY_TOPIC = ""
+Config.DISCORD_WEBHOOK = ""
+Config.EMAIL_FROM = ""
+Config.EMAIL_TO = ""
+Config.EMAIL_PASS = ""
 
 print("=" * 60)
 print("StwDO Dorm Agent - Smoke Test")

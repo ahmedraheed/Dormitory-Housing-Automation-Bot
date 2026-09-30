@@ -92,6 +92,14 @@ logging.basicConfig(
 )
 log = logging.getLogger("dorm_agent")
 
+# Fix Windows console encoding so Unicode characters render correctly
+if sys.stdout.encoding and sys.stdout.encoding.lower() not in ("utf-8", "utf8"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
 BERLIN_TZ = pytz.timezone("Europe/Berlin")
 
 
@@ -302,14 +310,16 @@ def human_type(page: Page, selector: str, text: str) -> None:
     """
     Click a field and type text character-by-character with random delays,
     mimicking a human typist.
+    Uses locator.press_sequentially() which is the modern Playwright API
+    (page.type() is deprecated since Playwright 1.45).
     """
-    page.click(selector)
+    loc = page.locator(selector).first
+    loc.click()
     human_delay(100, 300)
     # Clear existing value first
-    page.fill(selector, "")
+    loc.fill("")
     human_delay(50, 150)
-    for char in text:
-        page.type(selector, char, delay=random.uniform(40, 130))
+    loc.press_sequentially(text, delay=random.uniform(40, 130))
     human_delay(100, 250)
 
 
@@ -579,7 +589,9 @@ def safe_fill(page: Page, selector_chain: List[str], value: str, label: str = ""
         return False
     try:
         human_type(page, sel, value)
-        log.debug(f"Filled [{label}] → '{value[:4]}...' using selector: {sel}")
+        # Show a safe preview — avoids short-value truncation and encoding issues
+        preview = (value[:8] + "...") if len(value) > 8 else value
+        log.debug(f"Filled [{label}] -> '{preview}' using selector: {sel}")
         return True
     except Exception as exc:
         log.warning(f"Failed to fill [{label}]: {exc}")
@@ -616,22 +628,28 @@ def handle_mosparo_gate(page: Page) -> bool:
     Check if StwDO's Spam-Schutz (mosparo protection gate) is present.
     If so, automatically interacts with the verification widget and submits
     to unlock the housing listings page.
+
+    Returns True if the gate was detected (regardless of resolution outcome).
+    The bot should re-navigate if the gate is still blocking after handling.
     """
     try:
-        gate_form = page.locator("#housing-offers-access-form, form[action*='wohnen/aktuelle-wohnangebote']").first
+        gate_form = page.locator(
+            "#housing-offers-access-form, form[action*='wohnen/aktuelle-wohnangebote']"
+        ).first
         if not gate_form.is_visible(timeout=1_500):
             return False
 
-        log.info("[yellow]Spam-Schutz / Mosparo protection gate detected. Resolving access gate...[/]")
+        log.info("[yellow]Spam-Schutz / Mosparo gate detected. Resolving...[/]")
         human_delay(800, 1500)
 
+        # Try to click the mosparo checkbox — try selectors in order, stop at first success
         mosparo_selectors = [
             "#housing-offers-mosparo-box input[type='checkbox']",
-            "#housing-offers-mosparo-box label",
             "#housing-offers-mosparo-box .mosparo__checkbox",
-            "#housing-offers-mosparo-box",
+            "#housing-offers-mosparo-box label",
             ".mosparo__control",
             "label[for*='mosparo']",
+            "#housing-offers-mosparo-box",
         ]
 
         clicked = False
@@ -643,27 +661,40 @@ def handle_mosparo_gate(page: Page) -> bool:
                     human_delay(300, 600)
                     elem.click()
                     clicked = True
-                    break
+                    break  # Stop immediately after first successful click
             except Exception:
                 continue
 
         if not clicked:
-            try:
-                box = page.locator("#housing-offers-mosparo-box").first
-                if box.is_visible(timeout=1_000):
-                    box.click()
-                    clicked = True
-            except Exception:
-                pass
+            log.warning("Could not interact with mosparo widget — no selector matched.")
+            return True  # Gate was detected, even if we couldn't click it
 
+        # Wait for mosparo verification to complete (async network check)
         log.info("Waiting for spam protection verification to process...")
         try:
-            page.wait_for_load_state("networkidle", timeout=12_000)
+            page.wait_for_load_state("networkidle", timeout=15_000)
+        except Exception:
+            pass  # Continue even if network is still active
+
+        human_delay(1500, 2500)
+
+        # Verify the gate is gone — if still visible, submit the form
+        try:
+            if gate_form.is_visible(timeout=2_000):
+                # Gate still present — try submitting the access form
+                submit_btn = page.locator(
+                    "#housing-offers-access-form button[type='submit'], "
+                    "form[action*='wohnen'] button[type='submit']"
+                ).first
+                if submit_btn.is_visible(timeout=2_000):
+                    log.info("Submitting access form to bypass gate...")
+                    submit_btn.click()
+                    page.wait_for_load_state("domcontentloaded", timeout=15_000)
+                    human_delay(1000, 2000)
         except Exception:
             pass
 
-        human_delay(1500, 2500)
-        log.info("[green]Spam protection passed.[/]")
+        log.info("[green]Spam protection handling complete.[/]")
         return True
     except Exception as exc:
         log.debug(f"Spam gate handling check: {exc}")
@@ -681,20 +712,24 @@ def fill_application_form(page: Page, room_name: str = "Unknown room") -> bool:
 
     # Fill each field — non-fatal if individual fields are missing
     fill_results = {
-        "Vorname":    safe_fill(page, Selectors.VORNAME,   Config.FIRST_NAME, "Vorname"),
-        "Nachname":   safe_fill(page, Selectors.NACHNAME,  Config.LAST_NAME,  "Nachname"),
-        "Email":      safe_fill(page, Selectors.EMAIL,     Config.EMAIL,      "Email"),
-        "Telefon":    safe_fill(page, Selectors.PHONE,     Config.PHONE,      "Telefon"),
+        "Vorname":    safe_fill(page, Selectors.VORNAME,    Config.FIRST_NAME, "Vorname"),
+        "Nachname":   safe_fill(page, Selectors.NACHNAME,   Config.LAST_NAME,  "Nachname"),
+        "Email":      safe_fill(page, Selectors.EMAIL,      Config.EMAIL,      "Email"),
+        "Telefon":    safe_fill(page, Selectors.PHONE,      Config.PHONE,      "Telefon"),
     }
 
-    # Matrikelnummer is optional
+    # Optional fields
     if Config.MATRIKEL:
-        safe_fill(page, Selectors.MATRIKEL, Config.MATRIKEL, "Matrikelnummer")
+        safe_fill(page, Selectors.MATRIKEL,   Config.MATRIKEL,   "Matrikelnummer")
+    if Config.UNIVERSITY:
+        safe_fill(page, Selectors.HOCHSCHULE, Config.UNIVERSITY, "Hochschule")
 
     human_delay(300, 600)
 
     # Accept privacy / Datenschutz checkbox
     privacy_ok = safe_check(page, Selectors.DATENSCHUTZ, "Datenschutz")
+    if not privacy_ok:
+        log.warning("Datenschutz checkbox not found — form may be rejected.")
 
     human_delay(300, 700)
 
@@ -706,14 +741,18 @@ def fill_application_form(page: Page, room_name: str = "Unknown room") -> bool:
 
     try:
         page.locator(submit_sel).first.click()
-        # Wait for navigation or confirmation text
-        page.wait_for_load_state("networkidle", timeout=15_000)
+        # Wait for navigation or network idle after form submission
+        try:
+            page.wait_for_load_state("networkidle", timeout=15_000)
+        except PWTimeoutError:
+            pass  # Some sites don't fully idle after POST
         human_delay(500, 1000)
 
         # Check for success indicators in page text
         body_text = page.inner_text("body").lower()
         success_keywords = [
             "erfolgreich",
+            "bestaetigung",
             "bestätigung",
             "danke",
             "thank you",
@@ -747,7 +786,8 @@ def fill_application_form(page: Page, room_name: str = "Unknown room") -> bool:
 # ─────────────────────────────────────────────────────────────────────────────
 
 @retry(
-    retry=retry_if_exception_type((PWTimeoutError, Exception)),
+    # Only retry on network/timeout errors — not on KeyboardInterrupt or SystemExit
+    retry=retry_if_exception_type((PWTimeoutError, OSError, ConnectionError)),
     wait=wait_exponential(multiplier=2, min=5, max=120),
     stop=stop_after_attempt(5),
     before_sleep=before_sleep_log(log, logging.WARNING),
@@ -854,8 +894,9 @@ def check_and_apply(page: Page, applied_urls: set) -> int:
                     )
                     send_telegram(status_msg)
 
-                    # Go back to listings to continue searching
-                    page.go_back()
+                    # Navigate back to listings page directly (more reliable than go_back()
+                    # which can fail after a POST redirect or cross-origin navigation)
+                    page.goto(Config.LISTINGS_URL, wait_until="domcontentloaded", timeout=30_000)
                     human_delay(1000, 2000)
 
                 except Exception as exc:
@@ -912,7 +953,10 @@ def check_and_apply(page: Page, applied_urls: set) -> int:
 
                 apply_btn.click()
                 human_delay(600, 1200)
-                page.wait_for_load_state("domcontentloaded", timeout=15_000)
+                try:
+                    page.wait_for_load_state("domcontentloaded", timeout=15_000)
+                except PWTimeoutError:
+                    pass
 
                 success = fill_application_form(page, room_name)
                 send_telegram(
@@ -921,7 +965,8 @@ def check_and_apply(page: Page, applied_urls: set) -> int:
                     f"<b>{room_name}</b>"
                 )
 
-                page.go_back()
+                # Navigate back directly instead of go_back() to avoid POST-redirect issues
+                page.goto(Config.LISTINGS_URL, wait_until="domcontentloaded", timeout=30_000)
                 human_delay(800, 1500)
 
             except Exception as exc:
@@ -956,7 +1001,7 @@ def run_bot() -> None:
 
     console.rule("[bold blue]StwDO Dorm Monitor Bot[/]")
     log.info(
-        f"Config — Applicant: [bold]{Config.FIRST_NAME} {Config.LAST_NAME}[/] | "
+        f"Config - Applicant: [bold]{Config.FIRST_NAME} {Config.LAST_NAME}[/] | "
         f"Interval: {Config.POLL_INTERVAL}s | "
         f"Max runtime: {Config.MAX_RUNTIME_MIN}min | "
         f"Headless: {Config.HEADLESS}"
@@ -1024,7 +1069,7 @@ def run_bot() -> None:
                 remaining_s = (deadline - datetime.now(BERLIN_TZ)).total_seconds()
                 sleep_s = min(Config.POLL_INTERVAL, remaining_s)
                 if sleep_s > 0:
-                    log.info(f"[dim]Sleeping {sleep_s:.0f}s until next poll…[/]")
+                    log.info(f"[dim]Sleeping {sleep_s:.0f}s until next poll...[/]")
                     time.sleep(sleep_s)
 
         except KeyboardInterrupt:
