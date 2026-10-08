@@ -128,7 +128,7 @@ class Config:
     SEMESTER_TYPE: str  = os.getenv("APPLICANT_SEMESTER_TYPE", "").strip() or "Winter"
     YEAR: str           = os.getenv("APPLICANT_YEAR", "").strip() or "2026"
     NUM_SEMESTERS: str  = os.getenv("APPLICANT_NUM_SEMESTERS", "").strip() or "6"
-    MAX_RENT: str       = os.getenv("APPLICANT_MAX_RENT", "").strip() or "400"
+    MAX_RENT: str       = os.getenv("APPLICANT_MAX_RENT", "").strip() or "450"
     # DRY_RUN=true -> fill the form but do NOT submit (for testing)
     DRY_RUN: bool       = os.getenv("DRY_RUN", "false").lower() in ("1", "true", "yes")
     # Mobile number for the Wohnungshelden form (spaced format, e.g. +92 308 9876647)
