@@ -102,6 +102,9 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() not in ("utf-8", "utf8"):
 
 BERLIN_TZ = pytz.timezone("Europe/Berlin")
 
+# listing URL -> number of apply attempts made this session
+_ATTEMPTS: dict = {}
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Configuration — loaded from .env
@@ -117,6 +120,19 @@ class Config:
     PHONE: str          = os.getenv("APPLICANT_PHONE", "").strip() or "+3089876647"
     MATRIKEL: str       = os.getenv("APPLICANT_MATRIKEL", "").strip() or "285351"
     UNIVERSITY: str     = os.getenv("APPLICANT_UNIVERSITY", "").strip() or "TU Dortmund"
+
+    # Extra mandatory fields of the real Wohnungshelden application form
+    SALUTATION: str     = os.getenv("APPLICANT_SALUTATION", "").strip() or "Herr"
+    DOB: str            = os.getenv("APPLICANT_DOB", "").strip() or "30.08.2002"
+    NATIONALITY: str    = os.getenv("APPLICANT_NATIONALITY", "").strip() or "Pakistan"
+    SEMESTER_TYPE: str  = os.getenv("APPLICANT_SEMESTER_TYPE", "").strip() or "Winter"
+    YEAR: str           = os.getenv("APPLICANT_YEAR", "").strip() or "2026"
+    NUM_SEMESTERS: str  = os.getenv("APPLICANT_NUM_SEMESTERS", "").strip() or "6"
+    MAX_RENT: str       = os.getenv("APPLICANT_MAX_RENT", "").strip() or "400"
+    # DRY_RUN=true -> fill the form but do NOT submit (for testing)
+    DRY_RUN: bool       = os.getenv("DRY_RUN", "false").lower() in ("1", "true", "yes")
+    # Mobile number for the Wohnungshelden form (spaced format, e.g. +92 308 9876647)
+    MOBILE: str         = os.getenv("APPLICANT_MOBILE", "").strip()
 
     # Telegram (optional)
     BOT_TOKEN: str      = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -700,6 +716,233 @@ def handle_mosparo_gate(page: Page) -> bool:
         log.debug(f"Spam gate handling check: {exc}")
         return False
 
+def _wh_pick_option(frame, field_id: str, keywords: List[str], label: str) -> bool:
+    """Open a mat-select inside the Wohnungshelden iframe and pick an option."""
+    try:
+        sel = frame.locator(f"[id='{field_id}']").first
+        sel.evaluate("e => { e.scrollIntoView({block:'center'}); e.click(); }")
+        frame.locator("mat-option").first.wait_for(state="attached", timeout=5_000)
+        human_delay(250, 450)
+        opts = frame.locator("mat-option").all()
+        texts = [o.inner_text().strip() for o in opts]
+        for kw in keywords:
+            for o, t in zip(opts, texts):
+                if kw and kw.lower() in t.lower():
+                    o.evaluate("e => e.click()")
+                    human_delay(200, 400)
+                    return True
+        log.warning(f"[{label}] no option matched {keywords}. Options: {texts}")
+        frame.page.keyboard.press("Escape")
+    except Exception as exc:
+        log.warning(f"[{label}] select failed: {str(exc)[:200]}")
+    return False
+
+
+def _wh_toggle(frame, field_id: str, label: str) -> bool:
+    """Tick a Material checkbox/radio and verify it is really set."""
+    inp = frame.locator(f"[id='{field_id}']").first
+    attempts = (
+        lambda: frame.locator(f"label[for='{field_id}']").first.click(timeout=3_000, force=True),
+        lambda: inp.evaluate("e => e.click()"),
+        lambda: inp.locator(
+            "xpath=ancestor::*[self::mat-checkbox or self::mat-radio-button][1]"
+        ).evaluate("e => e.click()"),
+    )
+    for act in attempts:
+        try:
+            if inp.is_checked():
+                return True
+            act()
+            human_delay(150, 300)
+            if inp.is_checked():
+                return True
+        except Exception:
+            continue
+    log.warning(f"[{label}] could not be ticked")
+    return False
+
+
+def _wh_fill(frame, field_id: str, value: str, label: str) -> bool:
+    try:
+        loc = frame.locator(f"[id='{field_id}']").first
+        loc.wait_for(state="attached", timeout=5_000)
+        loc.evaluate("e => { e.scrollIntoView({block:'center'}); e.focus(); }")
+        loc.fill(value, force=True, timeout=5_000)
+        loc.dispatch_event("blur")
+        got = loc.input_value()
+        if got != value:
+            log.warning(f"[{label}] value mismatch: wanted '{value}', got '{got}'")
+        return True
+    except Exception as exc:
+        log.warning(f"[{label}] fill failed: {str(exc)[:200]}")
+        return False
+
+
+def apply_stwdo_listing(page: Page, url: str, room_name: str) -> bool:
+    """
+    Full apply flow for a https://www.stwdo.de/freie-zimmer/<id> listing:
+    listing page -> consent + mosparo -> 'Bewerbungsformular laden' ->
+    Wohnungshelden iframe form -> submit.
+    Returns True only if the form was submitted AND accepted.
+    """
+    listing_id = url.rstrip("/").split("/")[-1]
+    log.info(f"Opening listing page: {url}")
+    page.goto(url, wait_until="domcontentloaded", timeout=45_000)
+    human_delay(800, 1500)
+    handle_mosparo_gate(page)
+
+    # 1) consent checkbox (Wohnungshelden data processing)
+    try:
+        page.locator("#application-consent-cb").check(force=True, timeout=8_000)
+    except Exception as exc:
+        log.error(f"Consent checkbox not found: {exc}")
+        return False
+
+    # 2) mosparo for the application form
+    try:
+        box = f"#room-application-mosparo-box-{listing_id}"
+        page.locator(f"{box} .mosparo__checkbox").first.click(force=True, timeout=8_000)
+        page.locator(f"{box} .mosparo__icon-checkmark").first.wait_for(
+            state="visible", timeout=20_000
+        )
+    except Exception as exc:
+        log.warning(f"Mosparo verification not confirmed ({exc}); continuing anyway.")
+        human_delay(2000, 3000)
+
+    # 3) load the application form (iframe). Click ONCE and wait patiently:
+    # re-clicking reloads the iframe and invalidates frame handles.
+    human_delay(5000, 6000)
+
+    def _find_form_frame():
+        cands = [f for f in page.frames if "wohnungshelden" in f.url]
+        for f in reversed(cands):
+            try:
+                if f.locator("[id='mat-input-1']").count():
+                    return f
+            except Exception:
+                continue
+        return None
+
+    frame = None
+    for attempt in range(3):
+        try:
+            page.locator("#application-load-btn").click(timeout=8_000)
+        except Exception as exc:
+            log.warning(f"'Bewerbungsformular laden' click failed ({attempt + 1}/3): {exc}")
+        for _ in range(90):  # up to ~45 s
+            frame = _find_form_frame()
+            if frame:
+                break
+            time.sleep(0.5)
+        if frame:
+            break
+        log.warning(f"Iframe not ready after attempt {attempt + 1}/3 - retrying.")
+        human_delay(1500, 2500)
+    if frame:
+        time.sleep(1.5)  # let Angular settle
+        frame = _find_form_frame() or frame
+    if not frame:
+        log.error("Wohnungshelden form iframe did not load.")
+        try:
+            page.screenshot(path="iframe_fail.png", full_page=True)
+        except Exception:
+            pass
+        return False
+    human_delay(800, 1500)
+
+    # The sticky site header overlaps the iframe and intercepts clicks
+    try:
+        page.add_style_tag(content="#header__js{display:none !important}")
+    except Exception:
+        pass
+
+    # 4) fill the form
+    _wh_pick_option(frame, "mat-select-1", [Config.SALUTATION], "Anrede")
+    _wh_fill(frame, "mat-input-1", Config.FIRST_NAME, "Vorname")
+    _wh_fill(frame, "mat-input-2", Config.LAST_NAME, "Nachname")
+    _wh_fill(frame, "mat-input-0", Config.EMAIL, "E-Mail")
+    _wh_fill(frame, "mat-input-3", Config.PHONE, "Telefon")
+    mobile = Config.MOBILE
+    if not mobile:
+        digits = Config.PHONE.replace(" ", "")
+        if digits.startswith("+92") and len(digits) == 13:
+            mobile = f"+92 {digits[3:6]} {digits[6:]}"
+        else:
+            mobile = Config.PHONE
+    _wh_fill(frame, "formly_10_input_$$_mobile_number_$$_0", mobile, "Mobil")
+    _wh_fill(frame, "formly_10_input_$$_date_of_birth_$$_1", Config.DOB, "Geburtsdatum")
+    _wh_pick_option(frame, "formly_10_select_nationality_2",
+                    [Config.NATIONALITY, "pakistan"], "Nationality")
+    _wh_pick_option(frame, "formly_13_select_startOfSemester_0",
+                    [Config.SEMESTER_TYPE, "winter"], "Semester")
+    _wh_fill(frame, "formly_13_input_year_1", Config.YEAR, "Jahr")
+    _wh_fill(frame, "formly_13_input_numberOfSemester_2", Config.NUM_SEMESTERS, "Anzahl Semester")
+    _wh_fill(frame, "formly_14_input_stwdo_gesamtmiete_max_0", Config.MAX_RENT, "Max. Miete")
+    _wh_pick_option(frame, "formly_15_select_stwdo_university_0",
+                    [Config.UNIVERSITY, "dortmund"], "Hochschule")
+    # radio: _0_0 = Ja, _0_1 = Nein
+    _wh_toggle(frame, "formly_16_radio_stwdo_angewiesen_auf_rollstuhlgerechte_wohnung_0_1-input", "Rollstuhl: Nein")
+    _wh_toggle(frame, "formly_17_checkbox_stwdo_immatrikulation_0-input", "Immatrikulation")
+    _wh_toggle(frame, "formly_18_checkbox_stwdo_datenschutzhinweis_bestaetigt_0-input", "Datenschutz")
+
+    # Read back what the form now contains (visible in logs for debugging)
+    try:
+        vals = frame.evaluate(
+            """() => [...document.querySelectorAll('mat-form-field')].map(f => {
+                const l = (f.querySelector('mat-label,label')||{}).innerText || '?';
+                const i = f.querySelector('input,textarea');
+                const s = f.querySelector('.mat-mdc-select-value');
+                return l.trim().slice(0,25) + ' = ' + ((i && i.value) || (s && s.innerText) || '')
+            })"""
+        )
+        log.info("Form read-back: " + " | ".join(vals))
+    except Exception as exc:
+        log.debug(f"read-back failed: {exc}")
+    try:
+        errs = [e.inner_text().strip() for e in frame.locator("mat-error").all()]
+        if errs:
+            log.warning(f"Validation errors before submit: {errs}")
+    except Exception:
+        pass
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    try:
+        page.screenshot(path=f"before_submit_{stamp}.png", full_page=True)
+    except Exception:
+        pass
+
+    if Config.DRY_RUN:
+        log.warning("DRY_RUN enabled - form filled but NOT submitted.")
+        return False
+
+    # 5) submit
+    try:
+        frame.locator("button[type='submit']").first.click(timeout=8_000)
+    except Exception as exc:
+        log.error(f"Submit click failed: {exc}")
+        return False
+    human_delay(4000, 6000)
+
+    try:
+        text = frame.locator("body").inner_text(timeout=5_000).lower()
+    except Exception:
+        text = ""
+    try:
+        page.screenshot(path=f"after_submit_{stamp}.png", full_page=True)
+        with open(f"after_submit_{stamp}.txt", "w", encoding="utf-8") as fh:
+            fh.write(text[:5000])
+    except Exception:
+        pass
+
+    errors = frame.locator("mat-error").count()
+    still_form = "anfrage versenden" in text
+    if errors or still_form:
+        log.error(f"Submit rejected: {errors} validation error(s), form still shown.")
+        return False
+    log.info("[bold green][SUCCESS] Wohnungshelden accepted the application.[/]")
+    return True
+
+
 def fill_application_form(page: Page, room_name: str = "Unknown room") -> bool:
     """
     Detect and fill an application form on the current page.
@@ -723,6 +966,10 @@ def fill_application_form(page: Page, room_name: str = "Unknown room") -> bool:
         safe_fill(page, Selectors.MATRIKEL,   Config.MATRIKEL,   "Matrikelnummer")
     if Config.UNIVERSITY:
         safe_fill(page, Selectors.HOCHSCHULE, Config.UNIVERSITY, "Hochschule")
+
+    missing = [k for k, ok in fill_results.items() if not ok]
+    if missing:
+        log.warning(f"Fields NOT filled: {', '.join(missing)}")
 
     human_delay(300, 600)
 
@@ -764,17 +1011,26 @@ def fill_application_form(page: Page, room_name: str = "Unknown room") -> bool:
         ]
         success = any(kw in body_text for kw in success_keywords)
 
+        # Always save evidence of what the page looked like after submit
+        try:
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            page.screenshot(path=f"after_submit_{stamp}.png", full_page=True)
+            with open(f"after_submit_{stamp}.txt", "w", encoding="utf-8") as fh:
+                fh.write(f"URL: {page.url}\n\n{body_text[:5000]}")
+        except Exception as exc:
+            log.debug(f"Could not save post-submit evidence: {exc}")
+
         if success:
             log.info(
                 f"[bold green][SUCCESS] Application submitted successfully![/] Room: {room_name}"
             )
-        else:
-            log.warning(
-                "Form submitted but no explicit confirmation detected. "
-                "Manual verification recommended."
-            )
+            return True
 
-        return True  # We attempted submission
+        log.warning(
+            "Form submitted but NO confirmation detected - application is "
+            "probably NOT registered. Apply manually!"
+        )
+        return False
 
     except Exception as exc:
         log.error(f"Error clicking submit: {exc}")
@@ -827,6 +1083,55 @@ def check_and_apply(page: Page, applied_urls: set) -> int:
 
     # ── Detect listing cards / apply buttons ──────────────────────────────
     new_count = 0
+
+    # Strategy 0: real StwDO listings (/freie-zimmer/<id>, button "Mehr Informationen")
+    room_links = []
+    for a in page.locator("a[href*='/freie-zimmer/']").all():
+        try:
+            h = a.get_attribute("href") or ""
+            full = f"https://www.stwdo.de{h}" if h.startswith("/") else h
+            if full and full not in [u for u, _ in room_links]:
+                try:
+                    nm = a.locator(
+                        "xpath=ancestor::*[self::article or self::li or self::div][.//h2 or .//h3 or .//h4][1]"
+                    ).locator("h2, h3, h4").first.inner_text(timeout=1_500).strip()
+                except Exception:
+                    nm = "StwDO room"
+                room_links.append((full, nm))
+        except Exception:
+            continue
+
+    for url, nm in room_links:
+        if url in applied_urls or _ATTEMPTS.get(url, 0) >= 3:
+            continue
+        _ATTEMPTS[url] = _ATTEMPTS.get(url, 0) + 1
+        new_count += 1
+        log.info(f"[bold yellow]New listing:[/] {nm} ({url}) attempt {_ATTEMPTS[url]}/3")
+        send_telegram(
+            f"🏠 <b>New StwDO listing detected!</b>\n\nRoom: <b>{nm}</b>\n"
+            f"Link: {url}\n\nApplying now (attempt {_ATTEMPTS[url]}/3)..."
+        )
+        try:
+            ok = apply_stwdo_listing(page, url, nm)
+        except Exception as exc:
+            log.error(f"apply_stwdo_listing crashed: {exc}")
+            ok = False
+        if ok:
+            applied_urls.add(url)
+            send_telegram(
+                f"✅ <b>Application submitted & accepted!</b>\n\nRoom: <b>{nm}</b>\n"
+                f"Check your email ({Config.EMAIL}) for the confirmation."
+            )
+        else:
+            send_telegram(
+                f"⚠️ <b>Application NOT confirmed</b>\n\nRoom: <b>{nm}</b>\n"
+                f"APPLY MANUALLY NOW: {url}"
+            )
+        page.goto(Config.LISTINGS_URL, wait_until="domcontentloaded", timeout=30_000)
+        handle_mosparo_gate(page)
+        human_delay(1000, 2000)
+    if new_count:
+        return new_count
 
     # Strategy 1: Direct "Bewerben" links on the listing page
     for btn_sel in Selectors.APPLY_BUTTONS:
