@@ -116,7 +116,7 @@ class Config:
     # Applicant data (reads environment, falling back to registered details)
     FIRST_NAME: str     = os.getenv("APPLICANT_FIRST_NAME", "").strip() or "Ahmed"
     LAST_NAME: str      = os.getenv("APPLICANT_LAST_NAME", "").strip() or "Rasheed"
-    EMAIL: str          = os.getenv("APPLICANT_EMAIL", "").strip() or "ahmed.rasheed@tu-dortmund.de"
+    EMAIL: str          = os.getenv("APPLICANT_EMAIL", "").strip() or "Ahmedrasheed112255@gmail.com"
     PHONE: str          = os.getenv("APPLICANT_PHONE", "").strip() or "+3089876647"
     MATRIKEL: str       = os.getenv("APPLICANT_MATRIKEL", "").strip() or "285351"
     UNIVERSITY: str     = os.getenv("APPLICANT_UNIVERSITY", "").strip() or "TU Dortmund"
@@ -174,7 +174,7 @@ class Config:
         # Ensure core values are non-empty
         if not cls.FIRST_NAME: cls.FIRST_NAME = "Ahmed"
         if not cls.LAST_NAME:  cls.LAST_NAME  = "Rasheed"
-        if not cls.EMAIL:      cls.EMAIL      = "ahmed.rasheed@tu-dortmund.de"
+        if not cls.EMAIL:      cls.EMAIL      = "Ahmedrasheed112255@gmail.com"
         if not cls.PHONE:      cls.PHONE      = "+3089876647"
         # Check that at least ONE alert channel is configured
         has_telegram = bool(cls.BOT_TOKEN and cls.CHAT_ID)
