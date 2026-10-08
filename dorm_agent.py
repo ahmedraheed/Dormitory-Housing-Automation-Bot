@@ -1072,15 +1072,6 @@ def check_and_apply(page: Page, applied_urls: set) -> int:
 
     human_delay(500, 1200)
 
-    # ── Check for "no offers" empty state ──────────────────────────────────
-    for indicator in Selectors.EMPTY_INDICATORS:
-        try:
-            if page.locator(indicator).is_visible(timeout=1_000):
-                log.info("No active listings found. Portal shows empty state.")
-                return 0
-        except Exception:
-            pass
-
     # ── Detect listing cards / apply buttons ──────────────────────────────
     new_count = 0
 
