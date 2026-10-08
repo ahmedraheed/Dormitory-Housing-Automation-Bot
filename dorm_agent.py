@@ -801,7 +801,13 @@ def apply_stwdo_listing(page: Page, url: str, room_name: str) -> bool:
     # 2) mosparo for the application form
     try:
         box = f"#room-application-mosparo-box-{listing_id}"
-        page.locator(f"{box} .mosparo__checkbox").first.click(force=True, timeout=8_000)
+        mos_loc = page.locator(box).first
+        try:
+            mos_loc.scroll_into_view_if_needed(timeout=3_000)
+        except Exception:
+            pass
+        cb = page.locator(f"{box} .mosparo__checkbox, {box} input[type='checkbox']").first
+        cb.click(force=True, timeout=8_000)
         page.locator(f"{box} .mosparo__icon-checkmark").first.wait_for(
             state="visible", timeout=20_000
         )
@@ -811,7 +817,17 @@ def apply_stwdo_listing(page: Page, url: str, room_name: str) -> bool:
 
     # 3) load the application form (iframe). Click ONCE and wait patiently:
     # re-clicking reloads the iframe and invalidates frame handles.
-    human_delay(5000, 6000)
+    human_delay(3000, 4000)
+    load_btn = page.locator("#application-load-btn").first
+    try:
+        load_btn.scroll_into_view_if_needed(timeout=3_000)
+        # Wait up to 10s for the button to become enabled after mosparo passes
+        for _ in range(20):
+            if not load_btn.is_disabled():
+                break
+            time.sleep(0.5)
+    except Exception:
+        pass
 
     def _find_form_frame():
         cands = [f for f in page.frames if "wohnungshelden" in f.url]
@@ -826,7 +842,7 @@ def apply_stwdo_listing(page: Page, url: str, room_name: str) -> bool:
     frame = None
     for attempt in range(3):
         try:
-            page.locator("#application-load-btn").click(timeout=8_000)
+            load_btn.click(timeout=8_000)
         except Exception as exc:
             log.warning(f"'Bewerbungsformular laden' click failed ({attempt + 1}/3): {exc}")
         for _ in range(90):  # up to ~45 s
